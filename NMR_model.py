@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
+from torch.nn.utils.rnn import pad_sequence
 
 class DynamicNMRDataset(Dataset):
     def __init__(self, *x_signals, y):
@@ -20,49 +21,54 @@ class DynamicNMRDataset(Dataset):
 class DynamicNMRRegressor(nn.Module):
     def __init__(self, input_dims: list, num_targets: int, conv_filters: int = 32):
         """
-        :param input_dims: Список размерностей для каждого типа сигнала (например, [1000, 2000] для FID и CPMG)
+        :param input_dims: Список длин сигналов (например, [1000, 2000])
         :param num_targets: Количество целевых переменных (N)
-        :param conv_filters: Базовое количество фильтров в сверточных слоях
+        :param conv_filters: Базовое число фильтров в сверточных слоях
         """
         super().__init__()
-        self.num_experiments = len(input_dims)  # M
-        self.num_targets = num_targets          # N
+        self.num_experiments = len(input_dims)
+        self.num_targets = num_targets
         
-        # Динамическое создание ветвей для каждого типа сигнала
-        self.branches = nn.ModuleList()
-        for dim in input_dims:
-            branch = nn.Sequential(
-                nn.Conv1d(1, conv_filters, kernel_size=5, padding=2),
-                nn.ReLU(),
-                nn.MaxPool1d(4 if dim >= 2000 else 2),
-                nn.Conv1d(conv_filters, conv_filters * 2, kernel_size=5, padding=2),
-                nn.ReLU(),
-                nn.MaxPool1d(2),
-                nn.Flatten()
-            )
-            self.branches.append(branch)
+        # 1. Подготовка к объединению сигналов
+        self.max_len = max(input_dims)
         
-        # Вычисление общего размера признаков после всех ветвей
-        self.total_features = 0
-        for i, dim in enumerate(input_dims):
-            dummy_input = torch.zeros(1, 1, dim)
-            flattened_size = self.branches[i](dummy_input).shape[1]
-            self.total_features += flattened_size
+        # 2. Общие сверточные слои
+        self.shared_conv = nn.Sequential(
+            nn.Conv1d(self.num_experiments, conv_filters, kernel_size=5, padding=2),
+            nn.ReLU(),
+            nn.MaxPool1d(2),
+            nn.Conv1d(conv_filters, conv_filters * 2, kernel_size=5, padding=2),
+            nn.ReLU(),
+            nn.MaxPool1d(2),
+            nn.Flatten()
+        )
         
-        # Финальный классификатор
+        # 3. Вычисление размера выхода сверточной части
+        dummy_input = torch.zeros(1, self.num_experiments, self.max_len)
+        conv_out_size = self.shared_conv(dummy_input).shape[1]
+        
+        # 4. Финальные слои
         self.final_fc = nn.Sequential(
-            nn.Linear(self.total_features, 256),
+            nn.Linear(conv_out_size, 256),
             nn.ReLU(),
             nn.Dropout(0.3),
             nn.Linear(256, num_targets)
         )
+
     def forward(self, *x_signals):
-        # Обработка каждого сигнала через свою ветвь
-        features = []
-        for i in range(self.num_experiments):
-            x = x_signals[i].unsqueeze(1)  # Добавляем размерность канала [B, 1, L]
-            features.append(self.branches[i](x))
+        # 1. Приведение сигналов к одинаковой длине
+        padded_signals = []
+        for x in x_signals:
+            # padding к каждому сигналу
+            pad_size = self.max_len - x.shape[-1]
+            padded = torch.nn.functional.pad(x, (0, pad_size), mode='constant', value=0)
+            padded_signals.append(padded.unsqueeze(1))  # [B, 1, max_len]
         
-        # Объединение всех признаков
-        combined = torch.cat(features, dim=1)
-        return self.final_fc(combined)
+        # 2. Объединение по каналам
+        combined = torch.cat(padded_signals, dim=1)  # [B, M, max_len]
+        
+        # 3. Совместная обработка
+        features = self.shared_conv(combined)
+        
+        # 4. Предсказание
+        return self.final_fc(features)

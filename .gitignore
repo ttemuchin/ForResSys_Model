@@ -1,0 +1,10 @@
+pycache/
+__pycache__/
+разное
+signalsGenerator.exe
+experiments
+SygnalsNoise_005_001
+SygnalsWithoutNoise
+
+*.pth
+*.png
